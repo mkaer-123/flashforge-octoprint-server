@@ -1,1 +1,34 @@
-// WiFi configuration\nconst char* ssid = "Your_SSID";\nconst char* password = "Your_PASSWORD";\n\n// Serial settings\n#define SERIAL_PORT 1\n#define BAUD_RATE 115200\n\n// Server configuration\nconst char* server_host = "http://your.server.address";\nconst int server_port = 80;\n\n// Temperature limits\nconst float min_temp = 0.0;\nconst float max_temp = 300.0;\n\n// Debug macros\n#define DEBUG 1\n#if DEBUG\n    #define DEBUG_PRINT(x) Serial.println(x)\n#else\n    #define DEBUG_PRINT(x)\n#endif\n
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi Configuration
+#define WIFI_SSID "YOUR_SSID"
+#define WIFI_PASSWORD "YOUR_PASSWORD"
+
+// Serial Configuration
+#define FLASHFORGE_SERIAL Serial1
+#define FLASHFORGE_BAUD 115200
+#define DEBUG_SERIAL Serial
+#define DEBUG_BAUD 115200
+
+// Server Configuration
+#define SERVER_PORT 80
+#define STATUS_UPDATE_INTERVAL 5000  // ms
+#define SERIAL_TIMEOUT 1000          // ms
+
+// Temperature Limits
+#define MAX_NOZZLE_TEMP 250
+#define MAX_BED_TEMP 120
+#define MIN_NOZZLE_TEMP 0
+#define MIN_BED_TEMP 0
+
+// Debug Mode
+#define DEBUG_MODE true
+
+#if DEBUG_MODE
+  #define DEBUG_PRINT(x) DEBUG_SERIAL.println(x)
+#else
+  #define DEBUG_PRINT(x)
+#endif
+
+#endif
