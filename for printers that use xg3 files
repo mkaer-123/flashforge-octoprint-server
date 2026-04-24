@@ -1,0 +1,512 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+
+// WiFi Configuration - UPDATE THESE!
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+
+// Web Server on port 80
+WebServer server(80);
+
+// Serial Communication with Flashforge Creator Pro
+HardwareSerial& flashforgeSerial = Serial1;
+const unsigned long SERIAL_BAUD = 57600; // Creator Pro uses 57600, not 115200
+
+// Printer State - Updated for Creator Pro dual nozzle support
+struct PrinterState {
+  bool isConnected = false;
+  bool isPrinting = false;
+  float nozzle1Temp = 0.0;
+  float nozzle1TempTarget = 0.0;
+  float nozzle2Temp = 0.0;
+  float nozzle2TempTarget = 0.0;
+  float bedTemp = 0.0;
+  float bedTempTarget = 0.0;
+  int progress = 0;
+  String currentFile = "";
+  String status = "Idle";
+  unsigned long printTime = 0;
+  String printerModel = "Creator Pro";
+};
+
+PrinterState printerState;
+unsigned long lastStatusCheck = 0;
+const unsigned long STATUS_CHECK_INTERVAL = 5000;
+
+// Function Prototypes
+void initWiFi();
+void setupWebServer();
+void handleRoot();
+void handleStatus();
+void handleCommand();
+void handlePrintStart();
+void handlePrintStop();
+void handleTempSet();
+void handleFileList();
+void updatePrinterStatus();
+void sendFlashforgeCommand(String command);
+String readFlashforgeResponse();
+void parseFlashforgeResponse(String response);
+void connectPrinter();
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("\n\n=== Flashforge Creator Pro OctoPrint Server Starting ===");
+  
+  flashforgeSerial.begin(SERIAL_BAUD); // 57600 for Creator Pro
+  delay(500);
+  
+  initWiFi();
+  setupWebServer();
+  server.begin();
+  
+  Serial.println("HTTP Server started on port 80");
+  Serial.println("Access dashboard at: http://<Arduino_IP>");
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (millis() - lastStatusCheck >= STATUS_CHECK_INTERVAL) {
+    if (printerState.isConnected) {
+      updatePrinterStatus();
+    }
+    lastStatusCheck = millis();
+  }
+}
+
+void initWiFi() {
+  Serial.println("\nConnecting to WiFi: " + String(ssid));
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi connected!");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n✗ Failed to connect to WiFi");
+  }
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/command", HTTP_POST, handleCommand);
+  server.on("/api/print/start", HTTP_POST, handlePrintStart);
+  server.on("/api/print/stop", HTTP_POST, handlePrintStop);
+  server.on("/api/temp/set", HTTP_POST, handleTempSet);
+  server.on("/api/files", HTTP_GET, handleFileList);
+  server.on("/api/connect", HTTP_POST, []() {
+    connectPrinter();
+    server.send(200, "application/json", "{\"status\":\"connecting\"}");
+  });
+}
+
+void handleRoot() {
+  String html = R"rawliteral(<!DOCTYPE html>
+<html>
+<head>
+  <title>Flashforge Creator Pro OctoPrint Server</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header { 
+      background: rgba(255,255,255,0.1);
+      color: white;
+      padding: 30px;
+      border-radius: 12px;
+      margin-bottom: 30px;
+    }
+    .header h1 { font-size: 32px; margin-bottom: 10px; }
+    .header p { font-size: 14px; opacity: 0.9; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; }
+    .card { 
+      background: white;
+      padding: 25px;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+    }
+    .card h2 { font-size: 20px; margin-bottom: 15px; color: #333; }
+    .status-item { 
+      margin: 12px 0;
+      padding: 12px;
+      background: #f8f9fa;
+      border-left: 4px solid #667eea;
+      border-radius: 4px;
+    }
+    .status-label { font-weight: 600; color: #555; }
+    .status-value { color: #667eea; font-weight: 500; }
+    button { 
+      background: #667eea;
+      color: white;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      transition: 0.2s;
+    }
+    button:hover { background: #764ba2; }
+    .danger { background: #f5576c; }
+    .danger:hover { background: #e63e5a; }
+    .success { background: #00f2fe; color: #333; }
+    .success:hover { background: #00d9e5; }
+    input { 
+      padding: 10px;
+      margin: 6px;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      font-size: 14px;
+      width: 120px;
+    }
+    .progress { 
+      width: 100%;
+      height: 24px;
+      background: #e0e0e0;
+      border-radius: 12px;
+      overflow: hidden;
+      margin: 10px 0;
+    }
+    .progress-bar { 
+      height: 100%;
+      background: #667eea;
+      width: 0%;
+      transition: width 0.5s ease;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge.connected { background: #d4edda; color: #155724; }
+    .badge.disconnected { background: #f8d7da; color: #721c24; }
+    .dual-nozzle { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🖨️ Flashforge Creator Pro OctoPrint Server</h1>
+      <p>Arduino R4 WiFi - Remote Control (Creator Pro Optimized)</p>
+    </div>
+    
+    <div class="grid">
+      <div class="card">
+        <h2>📊 Status</h2>
+        <div class="status-item">
+          <span class="status-label">Connection:</span>
+          <span class="badge connected" id="connectionBadge">Disconnected</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">State:</span>
+          <span class="status-value" id="status">Idle</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Progress:</span>
+          <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+          <span id="progressText">0%</span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Model:</span>
+          <span class="status-value">Creator Pro (Dual Nozzle)</span>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h2>🌡️ Temperature</h2>
+        <div class="dual-nozzle">
+          <div>
+            <div class="status-item">
+              <span class="status-label">Nozzle 1:</span>
+              <span class="status-value"><span id="nozzle1Temp">--</span>°C / <span id="nozzle1TempTarget">--</span>°C</span>
+            </div>
+            <label style="display: block; font-weight: 600; margin-top: 8px; margin-bottom: 4px;">Set Nozzle 1:</label>
+            <input type="number" id="nozzle1TempInput" min="0" max="280" value="200">
+            <button class="success" onclick="setTemperature('nozzle1')" style="width: calc(100% - 12px);">Set</button>
+          </div>
+          <div>
+            <div class="status-item">
+              <span class="status-label">Nozzle 2:</span>
+              <span class="status-value"><span id="nozzle2Temp">--</span>°C / <span id="nozzle2TempTarget">--</span>°C</span>
+            </div>
+            <label style="display: block; font-weight: 600; margin-top: 8px; margin-bottom: 4px;">Set Nozzle 2:</label>
+            <input type="number" id="nozzle2TempInput" min="0" max="280" value="200">
+            <button class="success" onclick="setTemperature('nozzle2')" style="width: calc(100% - 12px);">Set</button>
+          </div>
+        </div>
+        <div class="status-item" style="margin-top: 15px;">
+          <span class="status-label">Bed:</span>
+          <span class="status-value"><span id="bedTemp">--</span>°C / <span id="bedTempTarget">--</span>°C</span>
+        </div>
+        <div style="margin-top: 10px;">
+          <label style="display: block; font-weight: 600; margin-bottom: 8px;">Set Bed:</label>
+          <input type="number" id="bedTempInput" min="0" max="120" value="60">
+          <button class="success" onclick="setTemperature('bed')" style="width: calc(100% - 12px);">Set</button>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h2>⚙️ Control</h2>
+        <button class="success" onclick="connectPrinter()" style="width: calc(50% - 6px);">Connect</button>
+        <button class="danger" onclick="disconnectPrinter()" style="width: calc(50% - 6px);">Disconnect</button>
+        <button class="success" onclick="startPrint()" style="width: calc(50% - 6px);">Start</button>
+        <button class="danger" onclick="stopPrint()" style="width: calc(50% - 6px);">Stop</button>
+        <button onclick="refreshStatus()" style="width: 100%;">🔄 Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function fetchStatus() {
+      try {
+        const response = await fetch('/api/status');
+        const data = await response.json();
+        updateUI(data);
+      } catch (error) {
+        console.error('Error:', error);
+      }
+    }
+
+    function updateUI(data) {
+      document.getElementById('connectionBadge').textContent = data.isConnected ? 'Connected' : 'Disconnected';
+      document.getElementById('connectionBadge').className = 'badge ' + (data.isConnected ? 'connected' : 'disconnected');
+      document.getElementById('status').textContent = data.status;
+      document.getElementById('nozzle1Temp').textContent = data.nozzle1Temp.toFixed(1);
+      document.getElementById('nozzle1TempTarget').textContent = data.nozzle1TempTarget.toFixed(1);
+      document.getElementById('nozzle2Temp').textContent = data.nozzle2Temp.toFixed(1);
+      document.getElementById('nozzle2TempTarget').textContent = data.nozzle2TempTarget.toFixed(1);
+      document.getElementById('bedTemp').textContent = data.bedTemp.toFixed(1);
+      document.getElementById('bedTempTarget').textContent = data.bedTempTarget.toFixed(1);
+      document.getElementById('progressBar').style.width = data.progress + '%';
+      document.getElementById('progressText').textContent = data.progress + '%';
+    }
+
+    async function connectPrinter() {
+      await fetch('/api/connect', { method: 'POST' });
+      setTimeout(fetchStatus, 1000);
+    }
+
+    async function disconnectPrinter() {
+      await fetch('/api/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'disconnect' })
+      });
+      setTimeout(fetchStatus, 500);
+    }
+
+    async function startPrint() {
+      await fetch('/api/print/start', { method: 'POST' });
+      setTimeout(fetchStatus, 500);
+    }
+
+    async function stopPrint() {
+      await fetch('/api/print/stop', { method: 'POST' });
+      setTimeout(fetchStatus, 500);
+    }
+
+    async function setTemperature(type) {
+      let temp;
+      if (type === 'nozzle1') {
+        temp = document.getElementById('nozzle1TempInput').value;
+      } else if (type === 'nozzle2') {
+        temp = document.getElementById('nozzle2TempInput').value;
+      } else {
+        temp = document.getElementById('bedTempInput').value;
+      }
+      await fetch('/api/temp/set', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: type, temperature: parseFloat(temp) })
+      });
+      setTimeout(fetchStatus, 500);
+    }
+
+    function refreshStatus() { fetchStatus(); }
+    setInterval(fetchStatus, 3000);
+    fetchStatus();
+  </script>
+</body>
+</html>)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  StaticJsonDocument<256> doc;
+  doc["isConnected"] = printerState.isConnected;
+  doc["isPrinting"] = printerState.isPrinting;
+  doc["nozzle1Temp"] = printerState.nozzle1Temp;
+  doc["nozzle1TempTarget"] = printerState.nozzle1TempTarget;
+  doc["nozzle2Temp"] = printerState.nozzle2Temp;
+  doc["nozzle2TempTarget"] = printerState.nozzle2TempTarget;
+  doc["bedTemp"] = printerState.bedTemp;
+  doc["bedTempTarget"] = printerState.bedTempTarget;
+  doc["progress"] = printerState.progress;
+  doc["currentFile"] = printerState.currentFile;
+  doc["status"] = printerState.status;
+  doc["printTime"] = printerState.printTime;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleCommand() {
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    deserializeJson(doc, server.arg("plain"));
+    String command = doc["command"];
+    
+    if (command == "disconnect") {
+      printerState.isConnected = false;
+      printerState.status = "Disconnected";
+    }
+  }
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handlePrintStart() {
+  // Creator Pro: Start print command
+  sendFlashforgeCommand("M24");
+  printerState.isPrinting = true;
+  printerState.status = "Printing";
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handlePrintStop() {
+  // Creator Pro: Stop print command
+  sendFlashforgeCommand("M25");
+  printerState.isPrinting = false;
+  printerState.status = "Stopped";
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleTempSet() {
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    deserializeJson(doc, server.arg("plain"));
+    String type = doc["type"];
+    float temp = doc["temperature"];
+    
+    String command = "";
+    if (type == "nozzle1") {
+      // Creator Pro T0 = Nozzle 1
+      command = "M104 T0 S" + String((int)temp);
+      printerState.nozzle1TempTarget = temp;
+    } else if (type == "nozzle2") {
+      // Creator Pro T1 = Nozzle 2
+      command = "M104 T1 S" + String((int)temp);
+      printerState.nozzle2TempTarget = temp;
+    } else if (type == "bed") {
+      command = "M140 S" + String((int)temp);
+      printerState.bedTempTarget = temp;
+    }
+    sendFlashforgeCommand(command);
+  }
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleFileList() {
+  StaticJsonDocument<256> doc;
+  JsonArray files = doc.createNestedArray("files");
+  files.add("model_dual_extrude.gcode");
+  files.add("test_print.gcode");
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void connectPrinter() {
+  Serial.println("Attempting to connect to Flashforge Creator Pro...");
+  // Send initial connection handshake for Creator Pro
+  sendFlashforgeCommand("M601");
+  delay(1000);
+  printerState.isConnected = true;
+  printerState.status = "Connected";
+  Serial.println("✓ Connection initiated - Creator Pro");
+}
+
+void updatePrinterStatus() {
+  // Query temperatures using Creator Pro format
+  sendFlashforgeCommand("M105");
+  delay(100);
+  String response = readFlashforgeResponse();
+  parseFlashforgeResponse(response);
+  
+  // Query print progress
+  sendFlashforgeCommand("M114");
+  delay(100);
+}
+
+void sendFlashforgeCommand(String command) {
+  flashforgeSerial.print(command);
+  flashforgeSerial.print("\r\n");
+  Serial.println(">> CMD: " + command);
+}
+
+String readFlashforgeResponse() {
+  String response = "";
+  unsigned long timeout = millis() + 1000;
+  
+  while (millis() < timeout) {
+    if (flashforgeSerial.available()) {
+      char c = flashforgeSerial.read();
+      response += c;
+      if (c == '\n') break;
+    }
+  }
+  
+  if (response.length() > 0) {
+    Serial.println("<< RESP: " + response);
+  }
+  return response;
+}
+
+void parseFlashforgeResponse(String response) {
+  // Creator Pro Temperature Response Format: T0:xxx T1:xxx B:xxx
+  // Extract Nozzle 1 (T0)
+  if (response.indexOf("T0:") >= 0) {
+    int idx = response.indexOf("T0:");
+    String tempStr = response.substring(idx + 3);
+    tempStr = tempStr.substring(0, tempStr.indexOf(" "));
+    printerState.nozzle1Temp = tempStr.toFloat();
+  }
+  
+  // Extract Nozzle 2 (T1)
+  if (response.indexOf("T1:") >= 0) {
+    int idx = response.indexOf("T1:");
+    String tempStr = response.substring(idx + 3);
+    tempStr = tempStr.substring(0, tempStr.indexOf(" "));
+    printerState.nozzle2Temp = tempStr.toFloat();
+  }
+  
+  // Extract Bed Temperature (B)
+  if (response.indexOf("B:") >= 0) {
+    int idx = response.indexOf("B:");
+    String tempStr = response.substring(idx + 2);
+    tempStr = tempStr.substring(0, tempStr.indexOf(" "));
+    printerState.bedTemp = tempStr.toFloat();
+  }
+}
